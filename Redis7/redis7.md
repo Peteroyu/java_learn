@@ -1662,7 +1662,7 @@ redis> ZMSCORE myzset "one" "two" "nofield"
 
 ###### 2.5.5集合运算
 
-> ​		有序集合中大部分命令是6.2.0 新增的，少部分是7.0.0 新增的，还有2.0.0 的版本。
+> 有序集合中大部分命令是6.2.0 新增的，少部分是7.0.0 新增的，还有2.0.0 的版本。
 
 - `zunion`：语法`ZUNION numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE <SUM | MIN | MAX>] [WITHSCORES]`，返回给定的numkeys个有序集合的并集。在给定要计算的key和其它参数之前，必须先给定key个数(numberkeys)。 默认情况下，结果集中成员的score由所有给定集下该成员score值之和。
   - `WEIGHTS`：默认为1，可以为每个给定的有序集指定一个乘法因子，即每个集合成员的score值在传递给聚合函数之前要先乘该因子。
@@ -4020,7 +4020,9 @@ redis > PUBSUB NUMPAT
 
 ##### 1.1 全量复制
 
-​		Slave首次连接或执行过`SLAVEOF no one`则会向主服务器发送`PSYNC ? -1`(在2.8版本之前是`SYNC`)，主动请求主服务器进行完整重同步。`master`收到后，会立即响应`FULLRESYNC runid offset`，从机保存Master的`runid`并将`offset`作为初始偏移量，之后Master会`fork`后台子线程执行`bgsave`命令并使用缓存区记录此后执行的写命令，`bgsave`执行完成后将生成的`RDB`文件发送给`slave`节点，然后`master`节点再将缓冲区内容以redis协议格式全部发送给`slave`节点。`slave`节点先删除旧数据，再将收到的`RDB`文件载入自己的内存，再加载所有收到缓冲区的内容，从而这样一次完整的数据同步。
+​		Slave首次连接或执行过`SLAVEOF no one`则会向主服务器发送`PSYNC ? -1`(在2.8版本之前是`SYNC`)，主动请求主服务器进行完整重同步。`master`收到后，会立即响应`FULLRESYNC runid offset`，从机保存Master的`runid`并将`offset`作为初始偏移量，之后Master会`fork`后台子线程执行`bgsave`命令并使用复制缓存区`client-output-buffer(replication buffer)`记录此后执行的写命令，`bgsave`执行完成后将生成的`RDB`文件发送给`slave`节点，然后`master`节点再将复制缓冲区内容以redis协议格式全部发送给`slave`节点。`slave`节点先删除旧数据，再将收到的`RDB`文件载入自己的内存，再加载所有收到缓冲区的内容，从而这样一次完整的数据同步。
+
+> **若从机开启了AOF，则在全量复制阶段会触发重写机制**
 
 ​		若从节点开启了`AOF`，则触发`bgrewriteaof`，保证AOF文件更新至最新状态。如果主节点接收到多个并发的全量同步请求，则只会执行单个后台保存以服务于所有从机。
 
@@ -4038,7 +4040,9 @@ redis > PUBSUB NUMPAT
 
 ​		如果从服务器已经复制过某个主服务器，那么从服务器在开始复制时将向主服务器发送`PSYNC <rep_id> <offset>`命令：其中`rep_id`是上次获取的Master的`master_replid`，而`offset`则是从服务器当前的复制偏移量+1。Master会通过这两个参数来判断应该对Slave执行哪种同步操作：`Slave`上报的`master_replid`与`Master`的`master_replid1`或[replid2](#replid2)其中一个是否相等，判断主从是否发生改变；`offset+1`来判断偏移量之后的数据是否还存在于积压缓冲区中。
 
+> **当主机版本过低，收到`psync`如何处理？**
 
+​		主服务器的版本低于`Redis 2.8`，识别不了`PSYNC`命令并返回`-ERR`回复，随后从服务器将向主服务器发送`SYNC`命令，并与主服务器执行全量同步。
 
 ###### 1.2.1 复制偏移量
 
@@ -4046,21 +4050,19 @@ redis > PUBSUB NUMPAT
 
 ​		如果`Master`和`Slave`之间的连接出现网络抖动，`Slave`会尝试增量同步，获取断开期间错过的==命令流部分==。否则，会请求进行全量同步，然后继续发送命令流同步。
 
-
-
 ###### 1.2.2 积压缓冲区
 
 
 
 <img src="img/1075473-20180801160728206-427681814.png" style="zoom:50%;" />
 
-​		`Master`中维护着一个复制积压缓冲区[replication buffer](#buffer12)，一个固定长度的FIFO队列，保存最近redis执行的命令，大小由配置参数`repl-backlog-size`指定（默认1MB），所有Slave共享此缓冲区，==备份==最近通过命令流同步给从库的数据（在主从命令传播阶段，Master不仅将写命令发送给Slave，还会备份一份到复制积压缓冲区）。复制积压缓冲区中还存储了每个字节相应的复制偏移量`offset`，并不断增长。
+​		`Master`中维护着一个复制积压缓冲区[replication buffer](#buffer12)，一个固定长度的FIFO队列，保存最近redis执行的命令和对应字节的复制偏移量`offset`，大小由配置参数`repl-backlog-size`指定（默认1MB），所有Slave共享此缓冲区，==备份==最近通过命令流同步给从库的数据（在主从命令传播阶段，Master不仅将写命令发送给Slave，还会备份一份到复制积压缓冲区）。当在命令传播阶段，主从断联恢复后，主库就会在`repl_backlog_buffer`中找到`offset`对应位置，并把之后的写命令写`replication buffer`同步给从库。
 
-​		比如若网络中断的平均时间是60s，而主节点平均每秒产生的写命令字节数为100KB，则复制积压缓冲区的平均需求为6MB，保险起见可以设置为12MB，来保证绝大多数断线情况都可以使用部分复制。
+​		**〖推荐大小〗**：比如若网络中断的平均时间是60s，而主节点平均每秒产生的写命令字节数为100KB，则复制积压缓冲区的平均需求为6MB，保险起见可以设置为12MB，来保证绝大多数断线情况都可以使用部分复制。
 
-> **注意：**
->
-> ​		如果主服务器返回`-ERR`回复，那么表示主服务器的版本低于`Redis 2.8`，识别不了`PSYNC`命令，从服务器将向主服务器发送`SYNC`命令，并与主服务器执行全量同步。
+> **`client-output-buffer-limit slave`复制缓冲区和`repl-backlog-size`积压缓冲区**：
+
+​		复制缓冲区只在全量复制时使用，而复制积压缓冲区只在增量复制时使用。复制缓冲区是为了保证RDB文件传输期间的数据一致性，而复制积压缓冲区是为了保证网络断连期间的数据一致性。复制缓冲区是客户端输出缓冲区的一种，主节点会为每一个从节点分别分配复制缓冲区；而复制积压缓冲区则是一个主节点只有一个，无论它有多少个从节点。
 
 
 
@@ -4167,7 +4169,7 @@ need_full_resync:
      * reply to PSYNC right now if a full SYNC is needed. The reply
      * must include the master offset at the time the RDB file we transfer
      * is generated, so we need to delay the reply to that moment. */
-    //如果需要完全同步，不能立即回复PSYNC请求，回复必须包含RDB文件生成时的master偏移量
+    //如果需要完全同步，不能立即回复PSYNC请求，还必须包含RDB文件生成时的master偏移量
     return C_ERR;
 }
 ```
@@ -4201,10 +4203,6 @@ need_full_resync:
 - `repl-timeout`：设置超时时间默认60秒，通过上两个参数判断。有两个作用：在全量复制过程中，若从节点在`repl-timeout`内未接收到主节点的数据，那么从节点会关闭连接并重新尝试复制；在主从节点正常通信时，若从节点在`repl-timeout`内未向主节点发送任何数据，那么主节点会认为从节点已经下线，并在`INFO replication`中显示该从节点的`lag=-1`。
 - [repl-disable-tcp-nodelay no](#delay123)：是否禁用`TCP_NODELAY`，控制主节点在命令传播阶段是否使用`Nagle`算法，以减少网络包的数量和带宽消耗，但是可能增加数据在从节点出现的延迟。
 - `min-slaves-to-write 3`与`min-slaves-max-lag 10`：保证主节点在不安全的情况下不会执行写命令。规定了主节点在执行写命令时，最小从节点数目，及对应的最大延迟（Master接收[REPLCONF ACK](#replack1)时间间隔），提高数据的可靠性和数据的一致性。
-
-> **`client-output-buffer-limit slave`和`repl-backlog-size`**：
->
-> ​		复制缓冲区只在全量复制时使用，而复制积压缓冲区只在增量复制时使用。复制缓冲区是为了保证RDB文件传输期间的数据一致性，而复制积压缓冲区是为了保证网络断连期间的数据一致性。复制缓冲区是客户端输出缓冲区的一种，主节点会为每一个从节点分别分配复制缓冲区；而复制积压缓冲区则是一个主节点只有一个，无论它有多少个从节点。
 
 ##### 2.2 Slave配置
 
@@ -4265,15 +4263,524 @@ need_full_resync:
 
 ## 哨兵Sentinel
 
-​		Redis 在 2.8 版本以后提供了哨兵机制`Sentinel`，实现主从节点故障转移，继续对外服务。它会监测主节点是否存活，如果发现主节点挂了，它就会选举一个从节点切换为主节点，并且把新主节点的相关信息通知给从节点和客户端。哨兵本质是一个运行在特殊模式下的 Redis 进程，相当于一个”观察者“节点，观察的对象是主从节点。观察到有异常的状况下，哨兵会做出一些“动作”：监控、选主、通知，来修复异常状态。 
+​		Redis 在 2.8 版本以后提供了哨兵机制`Sentinel`，实现主从节点故障转移，继续对外服务。它会监测主节点是否存活，如果发现主节点挂了，它就会选举一个从节点切换为主节点，并且把新主节点的相关信息通知给从节点和客户端。哨兵本质是一个运行在特殊模式下的 Redis 进程，相当于一个”观察者“节点，观察的对象是主从节点。观察到有异常的状况下，哨兵会做出一些“动作”：**监控**、**选主**、**通知**，来修复异常状态。 
 
-#### 1、故障判断
+#### 1、哨兵集群配置
 
-​		哨兵会每隔 1 秒给所有主从节点发送`PING`命令，当主从节点收到`PING`命令后，会发送一个响应命令给哨兵，这样就可以判断它们是否在正常运行。
+​		哨兵集群会记住所有已知的主副本，以及所有的哨兵（步骤省略）。如果需要删除哨兵中旧的副本信息，则需要向所有`Sentinels`发送`SENTINEL RESET mastername`命令，它们将在接下来的`10`秒内刷新`slave`列表，仅添加从当前`master` 的`INFO`输出的副本信息。
 
-​		如果主节点或者从节点没有在规定的时间内`down-after-milliseconds`响应哨兵的`PING`命令，哨兵就会将其标记为`SDOWN`「**主观下线**」。
+##### 1.1 配置参数
+
+​		配置文件名必须为：`sentinel.conf`，基础配置和redis服务配置参数一致，也可以在sentinel运行时进行配置修改：`SENTINEL MONITOR / REMOVE / SET / GET`。
+
+```bash
+bind 0.0.0.0
+daemonize yes
+protected-mode no
+port 26379 #sentinel实例端口号
+logfile "/myredis/sentinel26379.log"
+pidfile "/var/run/redis-sentinel26379.pid"
+dir "/myredis"  #工作目录
+sentinel monitor mymaster 127.0.0.1 6379 2
+sentinel auth-pass mymaster abc123 #master密钥
 
 
+#当前Sentinel节点监控指定ip port的主节点并设置quorum
+sentinel monitor <master-name> <ip> <port> <quorum>
+
+#设置指定时间内，若master没有回复或回复无效信息，则判定为主观下线
+sentinel down-after-milliseconds <master-name> <milliseconds>
+
+#设置在故障转移后同时可以并行同步主服务器的副本数量
+sentinel parallel-syncs <master-name> <nums>
+
+#故障转移超时重试的时间间隔，超过设置的毫秒，表示故障转移失败进行重试
+sentinel failover-timeout <master-name> <milliseconds>
+
+#配置当某一事件发生时所需要执行的脚本
+sentinel notification-script <master-name> <script-path>
+
+#客户端重新配置主节点参数脚本    
+sentinel client-reconfig-script <master-name> <script-path>
+```
+
+##### 1.2 哨兵启动
+
+​		可通过：`redis-sentinel /path/to/sentinel.conf`或`redis-server /path/to/sentinel.conf --sentinel`两种方式来启动`sentinel`。默认情况下，哨兵通过`26379`端口与哨兵集群及主从服务器`tcp`通信，可在配置中指定的`port`。
+
+
+
+#### 2、哨兵集群运行
+
+##### 2.1 监控
+
+###### 2.1.1 故障判断
+
+​		哨兵会每隔`1`秒给所有主从节点发送`PING`命令，当主从节点收到`PING`命令后，会发送一个有效响应命令给哨兵，监控并判断它们是否在正常运行。其中有效响应包括：`PONG`、`LOADING`、`MASTERDOWN`。其余的或指定时间内`down-after-milliseconds`（默认30秒）未收到则认定为无效回复，哨兵就会将其标记为`SRI_S_DOWN`「**主观下线**」。
+
+​		如果是单个哨兵，很可能出现误判，比如说网络拥塞、master实例假死、请求延迟，导致实例在某个短暂时间段不可用，后续又快速恢复了。所以需要哨兵集群来判断，当某哨兵判断主节点为主观下线后，就会向其他哨兵发起` sentinel is-master-down-by-addr`命令，其他哨兵收到这个命令后，就会根据自身和主节点的网络状况，做出赞成投票或者拒绝投票的响应，当的赞同票数达到配置文件中的`quorum`配置项设定的值后（一般设置为哨兵数/2+1），则将Master被标记为`SRI_O_DOWN`「**客观下线**」。
+
+```c++
+//sentinelHandleRedisInstance->sentinelCheckObjectivelyDown
+void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) {
+    ...
+    unsigned int quorum = 0, odown = 0;
+    if (master->flags & SRI_S_DOWN) {
+        quorum = 1; /* the current sentinel. */
+        /* Count all the other sentinels. */
+        di = dictGetIterator(master->sentinels);
+        while((de = dictNext(di)) != NULL) {
+            sentinelRedisInstance *ri = dictGetVal(de);
+
+            if (ri->flags & SRI_MASTER_DOWN) quorum++;
+        }
+        dictReleaseIterator(di);
+        //sentinel集群中判定为主观下线的数量是否达到quorum
+        if (quorum >= master->quorum) odown = 1;
+    }
+
+    /* Set the flag accordingly to the outcome. */
+    if (odown) {...}
+}
+```
+
+> <span id="ismasterdown1">`sentinel is-master-down-by-addr <ip> <port> <current_epoch> <runid>`</span>中的`runid`及返回参数意义：
+
+​		`runid`：当处于主观下线状态时：`*`代表只检测主节点的客观下线状态。当处于哨兵leader选取状态时：代表当前哨兵节点的运行ID，用于选举领头哨兵。
+
+​		有三个返回参数：`down_state`表示目标哨兵节点对主节点的检查结果，1代表已下线，0代表未下线；`leader_runid`目标哨兵节点的认定leader的运行ID，或者“.”表示不参与选举；`leader_epoch`：目标哨兵节点的局部领头哨兵的配置纪元。
+
+###### 2.1.2 哨兵与副本自动发现
+
+<img src="img/5143488cdcd04119aad9f8dfb8b6e5ad.png" style="zoom: 33%;" />
+
+​		通过`redis`的`pub/sub`订阅发布实现哨兵间通信和`slave`发现。哨兵之间可以相互通信，主要归功于`pub/sub`发布/订阅机制。每个哨兵与`master`建立通信之后，通过`master`提供的`__sentinel__:hello`频道发布自己的`name`、`IP`、`port`等信息，同时订阅其他哨兵发布的`Name`、`IP`、`Port`消息。互相发现之后建立起连接。
+
+​		主节点知道所有「从节点」的信息，所以哨兵会每`10`秒一次的频率向主节点发送`INFO`命令来获取所有「从节点」的信息。 如图，哨兵 B 给主节点发送 INFO 命令，主节点接受到这个命令后，就会把从节点列表返回给哨兵。接着，哨兵就可以根据从节点列表中的连接信息，和每个从节点建立连接，并在这个连接上持续地对从节点进行监控。哨兵 A 和 C 可以通过相同的方法和从节点建立连接。 
+
+**『总结』**：通过发布者/订阅者机制，哨兵之间可以相互感知组建集群，同时，哨兵又通过`INFO`命令，从主节点里获取所有从节点连接信息，于是就能和从节点逐个建立起连接，开始进行监控。在一般情况下，`Sentinel`每隔`10s`向所有的主从发送`INFO`命令。当`Master`被`Sentinel`标记为「客观下线」时，频率会从`10s`一次改为每秒一次，用于发现最新的集群拓扑结构。
+
+
+
+##### 2.2 选主
+
+​		当确认Master客观下线后，需要进行故障转移，而哨兵是以集群存在的，故需要先在哨兵集群中选择哨兵`Leader`来执行主从的故障转移，随后进行其他操作。
+
+###### 2.2.1 基于Raft算法选举sentinel leader
+
+​		判断主观下线的哨兵收到赞成数达到配置文件中的`quorum`值后，就会将主节点标记为「客观下线」，此哨兵成为`Leader`候选者。候选者会再向其他哨兵发送[sentinel is-master-down-by-addr](#ismasterdown1)命令，其中`runid`为该哨兵节点自己的`runid`，其他哨兵根据==先到先得==原则回复投票信息，且除了候选者外不能为自己投票。由`sentinel.c->*sentinelGetLeader`部分源码可知哨兵`Leader`的票数确定满足两个条件：①超过当前所有`sentinel`节点数一半以上；②需要大于sentinel配置中的`quorum`值（一般也取条件①的值），[分析](#entinelTimer123)。
+
+```c++
+voters = dictSize(master->sentinels)+1; /* All the other sentinels and me.*/
+...
+voters_quorum = voters/2+1;
+if (winner && (max_votes < voters_quorum || max_votes < master->quorum)) winner = NULL;
+```
+
+> **某时间点，有多个哨兵节点判断到主节点为客观下线，会出现竞选竞争，如何避免?**
+
+​		实际使用中集群基本部署在局域网，当一个`master`下线，所有`sentinel`都能很快感知其主观下线。由于`sentinel`都是通过时钟定时工作，所以为时钟的频率会引入随机数，来让`sentinel`执行时间和投票时间差异化，有效避免了竞争；而且引入`epoch`，来避免了哨兵集群的重复投票。
+
+```c++
+int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    ...
+    /* Run the Sentinel timer if we are in sentinel mode. */
+    if (server.sentinel_mode) sentinelTimer();
+    ...
+}
+
+void sentinelTimer(void) {
+    ...
+    server.hz = CONFIG_DEFAULT_HZ + rand() % CONFIG_DEFAULT_HZ;/* 定时器刷新频率添加随机数，添加投票的差异化。 */
+}
+```
+
+​		当一个哨兵投票其他哨兵来执行故障转移，它还会在`failover-timeout*2`时间后再次尝试对master的状态转移。为了避免所有的哨兵在同一时刻进行重试，在其为别的`leader`投票时，会随机增加一个`1000`以内的时间因子来记录当前开始障碍转移的开始时间。
+
+```c++
+//sentinelVoteLeader(..)
+master->failover_start_time = mstime() + rand() % SENTINEL_MAX_DESYNC;/* 故障转移开始时间添加一个随机时间因子*/
+
+
+//将下次故障转移开始的时间随机化，从而可以减少冲突的发生
+int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
+    ...
+    /* Last failover attempt started too little time ago? */
+    if ((mstime() - master->failover_start_time) < master->failover_timeout*2) {
+        if (master->failover_delay_logged != master->failover_start_time) {
+            time_t clock = (master->failover_start_time + master->failover_timeout*2) / 1000;
+           ...
+        return 0;
+    }...
+}
+```
+
+> **为什么哨兵集群需要设置为3个以上，且最好为奇数？**
+
+​		因为当哨兵节点数量为偶数时，容易发生“脑裂”`Split-Brain`：主节点和哨兵节点之间的网络通信出现故障，导致哨兵节点之间无法协商选举出新的主节点，之后两个候选者都会随机等待一定时间，再次发起选举。为了避免这种情况发生，需要将哨兵节点数量设置为奇数，这样在出现网络故障时，多数派的哨兵节点能够选举出一个唯一的主节点，并保证集群的高可用性。同时，将哨兵节点的数量设置为3个以上，可以在某一个哨兵节点发生故障时，仍然能够保持集群的正常运行。
+
+
+
+###### 2.2.2 主从故障转移
+
+**①选取新Master**：
+
+​		有了`sentinel leader`之后，开始故障转移，首先选择slaver节点来作为新的master。选举的过程会比较严谨，需要通过筛选 + 三轮考察来选择从节点执行`slaveof no one`使其作为新主节点并删除配置文件中`salveof`配置项：
+
+- 筛选：排除与master断联时间过长的从机。若该副本与主服务器断开的时间超过`(down-after-milliseconds * 10) + milliseconds_since_master_is_in_SDOWN_state`（十倍断联时间加上master被判定为主观下线以来的时间），就说明这个从节点的网络状况不好直接排除。
+- 优先级：通过比较`redis.conf`配置文件中的`replica-priority`配置项，越小越优先，选择优先级最高的节点。可以给不同的从库设置不同优先级。
+- 复制偏移量：如果优先级相同，则检查副本处理的复制偏移量并偏移量最大的，即`slave_repl_offset`与`master_repl_offset`差距数据偏移量差距最小的。
+- `runid`：在优先级和复制进度都相同的情况下，则选择具有字典顺序(ascii)较小的`runid`的副本。
+
+```bash
+lateency-tracking-info-percentiles 50 99 99.9
+#默认用户访问权限和密码
+user default on #bcb16f821479b4d5772db0c866c00ad5f926e.... ~* &* +@all
+```
+
+**②slave复制新主**：Sentinel领导者节点会向剩余的从节点发送命令`slaveof ip port`，让它们成为新主节点的从节点并==更新其配置文件==，覆盖`slaveof`配置项，同时并发复制个数与`parallel-syncs`配置参数有关。
+
+```bash
+#Generated by CONFIG REWRITE
+replication 192.168.10.102 6380
+save 3600 1 300 100 60 10000
+lateency-tracking-info-percentiles 50 99 99.9
+user default on #bcb16f821479b4d5772db0c866c00ad5f926e.... ~* &* +@all
+```
+
+**③监控旧的Master**：继续监视旧主节点，当这个旧主节点重新上线时，将它设置为新主节点的从节点并更新配置文件，新增`slaveof`配置项。为了避免发生`master_link_status:down`报错需要为`master`配置密码。
+
+
+
+##### 2.3 通知
+
+​		当被监控的服务器出现问题时，向其他（哨兵间，客户端）发送通知，完成故障转移后通知其他`sentinel`新主并更改配置文件，然后将其他`slave`连接到新的`master`，并告知客户端新的服务器地址。
+
+```bash
+#Generated by CONFIG REWRITE
+latency-tracking-info-percentiles 5o 99 99.9
+user default on nopass ~*&*+@all
+sentinel myid 67aba6b67cO7cf1757ed5469b686efcf5e9775be
+sentinel config-epoch mymaster 1
+sentinel leader-epoch mymaster 1
+sentinel current-epoch 1
+sentinel known-replica mymaster 192.168.111.185 6379
+sentinel known-replica mymaster 192.168.111.172 6380
+sentinel known-sentinel mymaster 192.168.111.185 26380 006af38b87b4aab62c3beo26b9a3549efcdocded
+sentinel known-sentinel mymaster 192.168.111.185 26381 3936eb699b6e61437e84cbc7e29c6eOda7960343
+```
+
+​		客户端也是通过`pub/sub`订阅哨兵的`__sentinel__:hello`等频道，进行事件通知获取`sentinel`状态信息。若发生了障碍转移，则sentinel会报告新的主从地址。此外，Sentinel可以通过配置文件中`notify-script`，执行自定义的脚本来通知系统管理员或其他程序。
+
+#### 4、优缺点
+
+​		哨兵模式基于主从复制，因此主从复制的优点哨兵都具备、哨兵具备了主从切换和故障转移，因此集群有了==更高==的可用性。但哨兵集群+主从复制，每台机器都存储相同内容，很浪费内存且不能保证数据零丢失；`Redis`较难支持在线扩容，操作比较复杂。
+
+
+
+## Redis集群
+
+​		`redis cluster`实现了分布式存储。每台机器节点上存储不同的内容。
+
+#### 1、slots槽位
+
+**3.2 Redis Cluster 数据分片原理**
+redis 数据分片使用的是hash slot， redis集群有16384个哈希槽，每个Key通过CRC16校验后对16384取模来决定放置哪一个槽。
+当存取redis key时候，redis会根据CRC16算法得到一个结果，然后把结果和16384求余，通过这个值去对应得节点获取数据。
+这个时候，应用客户端实际上只需要连接其中任意一个节点即可，然后Redis Cluster 中每个节点都保存了其他节点得槽信息。这样当存取key计算完槽之后，通过保存槽信息从配置中获取节点信息，然后再去对应得节点获取数据。
+
+**3.3 Redis Cluster 复制原理**
+redis-cluster集群引入了主从复制模型，一个主节点对应一个或者多个从节点，当主节点宕机的时候，就会启用从节点。当其它主节点 ping 一个主节点 A 时，如果半数以上的主节点与 A 通信超时，那么认为主节点 A 宕机了。如果主节点 A 和它的从节点 A1 都宕机了，那么该集群就无法再提供服务了
+
+**3.4 redis Cluster 优缺点**
+**优点：**
+实现了分布式存储，节省了内存
+
+
+
+
+
+
+
+## 源码分析
+
+#### 哨兵leader
+
+**①检测是否客观下线并开始处理**
+
+<span id="entinelTimer123">		</span>首先由`entinelTimer`主程序进入`sentinelHandleDictOfRedisInstances`进入`sentinelHandleRedisInstance`开始判断是否出现了`Master`客观下线
+
+```c++
+void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
+    /* ========== MONITORING HALF ============ */
+    /* Every kind of instance */
+    sentinelReconnectInstance(ri);
+    sentinelSendPeriodicCommands(ri);
+
+    /* ============== ACTING HALF ============= */
+    /* We don't proceed with the acting half if we are in TILT mode.
+     * TILT happens when we find something odd with the time, like a
+     * sudden change in the clock. */
+    if (sentinel.tilt) {
+        if (mstime()-sentinel.tilt_start_time < sentinel_tilt_period) return;
+        sentinel.tilt = 0;
+        sentinelEvent(LL_WARNING,"-tilt",NULL,"#tilt mode exited");
+    }
+
+    /* Every kind of instance 是否出现主观下线 */
+    sentinelCheckSubjectivelyDown(ri);
+
+    /* Masters and slaves 从机不做处理*/
+    if (ri->flags & (SRI_MASTER|SRI_SLAVE)) {
+        /* Nothing so far. */
+    }
+
+    /* Only masters */
+    if (ri->flags & SRI_MASTER) {
+        sentinelCheckObjectivelyDown(ri);//判断是否出现客观下线
+        if (sentinelStartFailoverIfNeeded(ri))//是否可启动故障转移
+            //向其他 Sentinel 发送强制要求同步信息
+            sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
+        sentinelFailoverStateMachine(ri);// 进行故障转移的状态机处理
+        //向其他 Sentinel 发送要求同步信息
+        sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_NO_FLAGS); 
+    }
+}	
+```
+
+​		在哨兵的“主函数”`sentinelHandleRedisInstance`中，通过调用函数`sentinelAskMasterStateToOtherSentinels`当前哨兵认定Master为主观下线且满足故障转移条件后，将强制启动与集群中sentinel的同步信息，向其他哨兵发送`sentinel is-master-down-by-addr`命令获取其他哨兵对Master的判断，通过[sentinelReceiveIsMasterDownReply](#sentinelReceiveIsMasterDownReply)回调函数处理回复。
+
+```c++
+//sentinelHandleRedisInstance->sentinelAskMasterStateToOtherSentinels
+void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int flags) {
+    dictIterator *di;
+    dictEntry *de;
+    //从master信息中获取所有的sentinel，并开始遍历询问
+    di = dictGetIterator(master->sentinels);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *ri = dictGetVal(de);
+        mstime_t elapsed = mstime() - ri->last_master_down_reply_time;
+        char port[32];
+        int retval;
+
+        /* If the master state from other sentinel is too old, we clear it. */
+        //超时则清除其对于master的过时的状态记录
+        if (elapsed > sentinel_ask_period*5) {
+            ri->flags &= ~SRI_MASTER_DOWN;
+            sdsfree(ri->leader);
+            ri->leader = NULL;
+        }
+
+        /* 当sentinel满足下面三个条件时，才会询问其他的sentinel与master的状态
+          1) 当前哨兵认为主管下线，或者已经一个障碍转移进程
+          2) 哨兵没有断开连接
+          3) 未开启强制询问或在SENTINEL_ASK_PERIOD ms指定时间内未收到是否主观下线回复. */
+        if ((master->flags & SRI_S_DOWN) == 0) continue;
+        if (ri->link->disconnected) continue;
+        if (!(flags & SENTINEL_ASK_FORCED) && //是否强制询问
+                   mstime() - ri->last_master_down_reply_time < sentinel_ask_period)
+            continue;
+
+        //当sentinel侦测master主观下线，则参数发送'*',等待确认客观下线
+        //当确认客观下线后，master->failover_state会被标记为故障转移阶段，则发送当前sentinel的runid拉票
+        ll2string(port,sizeof(port),master->addr->port);
+        retval = redisAsyncCommand(ri->link->cc, 
+                    sentinelReceiveIsMasterDownReply, ri,//处理投票等回复
+                    "%s is-master-down-by-addr %s %s %llu %s",
+                    sentinelInstanceMapCommand(ri,"SENTINEL"),
+                    announceSentinelAddr(master->addr), port,sentinel.current_epoch,
+                    (master->failover_state > SENTINEL_FAILOVER_STATE_NONE) ? sentinel.myid : "*");
+        if (retval == C_OK) ri->link->pending_commands++;
+    }
+    dictReleaseIterator(di);
+}
+```
+
+**②被请求的sentinel接受到请求信息，开始投票处理**
+
+​		哨兵集群中接到拉票请求，通过`sentinelCommand`调用`sentinelVoteLeader`，开始执行投票流程。如果不是为了选举故障转移的`leader`寻求哨兵投票，那么`runid`就是`*`。否则为哨兵拉票的`runid`，前提是当前`epoch`下该`entinel`还未投票。
+
+```c++
+void sentinelCommand(client *c) {
+...
+else if (!strcasecmp(c->argv[1]->ptr,"is-master-down-by-addr")) {
+    sentinelRedisInstance *ri;
+    long long req_epoch;
+    uint64_t leader_epoch = 0;
+    char *leader = NULL;
+    long port;
+    int isdown = 0;
+
+    if (c->argc != 6) goto numargserr;
+    
+    if (getLongFromObjectOrReply(c,c->argv[3],&port,NULL) != C_OK ||
+        getLongLongFromObjectOrReply(c,c->argv[4],&req_epoch,NULL) != C_OK)
+        return;
+    ri = getSentinelRedisInstanceByAddrAndRunID(sentinel.masters, c->argv[2]->ptr,port,NULL);
+
+    //若处于titl模式，会一直返回默认值0，若runid为*，则直接进行后面的返回参数操作
+    if (!sentinel.tilt && ri && (ri->flags & SRI_S_DOWN) && (ri->flags & SRI_MASTER))
+        isdown = 1;
+
+    //当请求的runid为sentinel的runid，而非*，则请求投票
+    if (ri && ri->flags & SRI_MASTER && strcasecmp(c->argv[5]->ptr,"*")) {
+        leader = sentinelVoteLeader(ri,(uint64_t)req_epoch,
+                                        c->argv[5]->ptr,
+                                        &leader_epoch);
+    }
+
+    /* 返回三个参数：down state, leader, vote epoch. */
+    addReplyArrayLen(c,3);
+    addReply(c, isdown ? shared.cone : shared.czero);
+    addReplyBulkCString(c, leader ? leader : "*");
+    addReplyLongLong(c, (long long)leader_epoch);
+    if (leader) sdsfree(leader);
+}... 
+}
+```
+
+​		当请求的朝代`req_epoch`高于当前被请求的哨兵和master领导的朝代，则更新被请求哨兵和master的朝代，更新master中leader的runid，标记当前sentinel选择的哨兵leader。若`req_epoch`低于当前的`sentinel`，则返回旧的投票信息或`null`。
+
+```c++
+char *sentinelVoteLeader(
+  sentinelRedisInstance *master, uint64_t req_epoch, char *req_runid, uint64_t *leader_epoch) {
+    //更新当前sentinel的纪元，并发送一个+new-epoch事件同步epoch，保证多个 sentinel 数据一致性。
+    if (req_epoch > sentinel.current_epoch) {
+        sentinel.current_epoch = req_epoch;
+        sentinelFlushConfig();
+        sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",(unsigned long long) sentinel.current_epoch);
+    }
+    //master中的epoch、当前sentinel的纪元低于请求的sentinel，则进行投票等操作
+    //有可能出现多次选举，投票给最大一轮选举的 sentinel
+    if (master->leader_epoch < req_epoch && sentinel.current_epoch <= req_epoch)
+    {
+        sdsfree(master->leader);
+        master->leader = sdsnew(req_runid);
+        master->leader_epoch = sentinel.current_epoch;
+        sentinelFlushConfig();
+        sentinelEvent(LL_WARNING,"+vote-for-leader",master,"%s %llu",
+            master->leader, (unsigned long long) master->leader_epoch);
+        //若当前 Sentinel不作为leader，那么先设置故障转移开始时间为当前时间并增加一个随机时间因子，
+        //以避免在之后同一时间可能重试故障转移带来冲突。
+        if (strcasecmp(master->leader,sentinel.myid))
+            master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;//当前时间+1000以内的数
+    }
+    //更新回复的投票朝代poech，若之前没有投票则返回旧的poech
+    *leader_epoch = master->leader_epoch;
+    return master->leader ? sdsnew(master->leader) : NULL;
+}
+```
+
+**③接收投票信息，并校验，随后选出leader**
+
+​		候选Leader开始通过<span id="sentinelReceiveIsMasterDownReply">`sentinelReceiveIsMasterDownReply`</span>处理回复的投票信息：
+
+```c++
+void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *privdata) {
+    sentinelRedisInstance *ri = privdata;
+    instanceLink *link = c->data;
+    redisReply *r;
+
+    if (!reply || !link) return;
+    link->pending_commands--;
+    r = reply;
+
+    /* Ignore every error or unexpected reply.
+     * Note that if the command returns an error for any reason we'll
+     * end clearing the SRI_MASTER_DOWN flag for timeout anyway. */
+    if (r->type == REDIS_REPLY_ARRAY && r->elements == 3 &&
+        r->element[0]->type == REDIS_REPLY_INTEGER &&
+        r->element[1]->type == REDIS_REPLY_STRING &&
+        r->element[2]->type == REDIS_REPLY_INTEGER)
+    {
+        ri->last_master_down_reply_time = mstime();//设置回复时间
+        //ri sentinel 回复：它也检测到该 master 节点已经主观下线。
+        if (r->element[0]->integer == 1) {
+            ri->flags |= SRI_MASTER_DOWN;
+        } else {
+            ri->flags &= ~SRI_MASTER_DOWN;
+        }
+        //若回复的runid不是*，则代表回复的是目标sentinel选择投票的leader
+        if (strcmp(r->element[1]->str,"*")) {
+            /*当前 sentinel 向 ri 拉选票，ri 回复：它所投票的 sentinel（runid）*/
+            sdsfree(ri->leader);
+            if ((long long)ri->leader_epoch != r->element[2]->integer)
+                serverLog(LL_WARNING, "%s voted for %s %llu", ri->name, r->element[1]->str,
+                    (unsigned long long) r->element[2]->integer);
+            //分别将其选择的领导节点的运行ID和epoch记录到ri->leader和ri->leader_epoch中；
+            ri->leader = sdsnew(r->element[1]->str);
+            ri->leader_epoch = r->element[2]->integer;
+        }
+    }
+}
+```
+
+​		之后执行`sentinelHandleRedisInstance`后续调用的方法`sentinelFailoverStateMachine`->`sentinelFailoverWaitStart`->`sentinelGetLeader`，投出自己的一票并选出最终的leader，随后通过向其他`Sentinel`发送要求同步信息。
+
+```c++
+char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
+    dict *counters;
+    dictIterator *di;
+    dictEntry *de;
+    unsigned int voters = 0, voters_quorum;
+    char *myvote;
+    char *winner = NULL;
+    uint64_t leader_epoch;
+    uint64_t max_votes = 0;
+
+    serverAssert(master->flags & (SRI_O_DOWN|SRI_FAILOVER_IN_PROGRESS));
+    counters = dictCreate(&leaderVotesDictType);
+
+    voters = dictSize(master->sentinels)+1; /* All the other sentinels and me.*/
+
+    /* 统计其他sentinel的票数 */
+    di = dictGetIterator(master->sentinels);
+    while((de = dictNext(di)) != NULL) {
+        sentinelRedisInstance *ri = dictGetVal(de);
+        if (ri->leader != NULL && ri->leader_epoch == sentinel.current_epoch)
+            sentinelLeaderIncr(counters,ri->leader);
+    }
+    dictReleaseIterator(di);
+
+    /* Check what's the winner. For the winner to win, it needs two conditions:
+     * 1) Absolute majority between voters (50% + 1).
+     * 2) And anyway at least master->quorum votes. */
+    di = dictGetIterator(counters);
+    while((de = dictNext(di)) != NULL) {
+        uint64_t votes = dictGetUnsignedIntegerVal(de);
+
+        if (votes > max_votes) {
+            max_votes = votes;
+            winner = dictGetKey(de);
+        }
+    }
+    dictReleaseIterator(di);
+
+    /* 如果没人来拉票，我也没有投过票，那么可以投自己，否则自己投票数多的人。*/
+    if (winner)
+        myvote = sentinelVoteLeader(master,epoch,winner,&leader_epoch);
+    else
+        myvote = sentinelVoteLeader(master,epoch,sentinel.myid,&leader_epoch);
+
+    if (myvote && leader_epoch == epoch) {
+        uint64_t votes = sentinelLeaderIncr(counters,myvote);
+
+        if (votes > max_votes) {
+            max_votes = votes;
+            winner = myvote;
+        }
+    }
+
+    voters_quorum = voters/2+1;
+    if (winner && (max_votes < voters_quorum || max_votes < master->quorum))
+        winner = NULL;
+
+    winner = winner ? sdsnew(winner) : NULL;
+    sdsfree(myvote);
+    dictRelease(counters);
+    return winner;
+}
+```
 
 
 
